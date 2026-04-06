@@ -8,7 +8,7 @@ Position per straddle unit:
 
 Initial capital: $8,000
 Session: S3 (14:00–18:00 UTC)
-Sweep: 6 allocations × 2 sizing × 1 fee = 12 variants (TP disabled)
+Sweep: 9 allocations × 2 sizing × 1 fee = 18 variants (TP disabled)
 """
 import sys
 import importlib.util
@@ -45,7 +45,7 @@ df = bt.load_data()
 print("Data loaded.\n", flush=True)
 
 LEVERAGE = 10
-ALLOCS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
+ALLOCS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
 SIZING_MODES = [("flat", True), ("compound", False)]
 FEE = 0
 
