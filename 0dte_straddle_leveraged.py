@@ -388,7 +388,7 @@ def _process_session(sess_id, entry_time, close_time, half_alloc,
     }
 
 
-def run_backtest(df, fee_bps, leverage, tp_enabled=True, session_filter="all",
+def run_backtest(df, fee_bps, leverage, tp_enabled=False, session_filter="all",
                  alloc_pct=None, flat_sizing=False, fixed_num=None):
     """Run the backtest.
 

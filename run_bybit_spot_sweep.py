@@ -8,7 +8,7 @@ Position per straddle unit:
 
 Initial capital: $8,000
 Session: S3 (14:00–18:00 UTC)
-Sweep: 6 allocations × 2 sizing × 2 TP × 1 fee = 24 variants
+Sweep: 6 allocations × 2 sizing × 1 fee = 12 variants (TP disabled)
 """
 import sys
 import importlib.util
@@ -37,7 +37,7 @@ print("Bybit Spot Config:")
 print(f"  QTY           = {bt.QTY} BTC spot per straddle")
 print(f"  NUM_PUTS      = {bt.NUM_PUTS} (put notional = {bt.NUM_PUTS * bt.QTY} BTC)")
 print(f"  Initial Cap   = ${bt.INITIAL_CAPITAL:,}")
-print(f"  TP            = {bt.TP_PCT*100:.0f}% of put cost")
+print(f"  TP            = disabled (mechanic available at {bt.TP_PCT*100:.0f}% of put cost)")
 print("=" * 70)
 
 print("\nLoading data once ...", flush=True)
@@ -47,27 +47,24 @@ print("Data loaded.\n", flush=True)
 LEVERAGE = 10
 ALLOCS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
 SIZING_MODES = [("flat", True), ("compound", False)]
-TP_MODES = [True, False]
 FEE = 0
 
 results = []
-combos = list(itertools.product(ALLOCS, SIZING_MODES, TP_MODES))
+combos = list(itertools.product(ALLOCS, SIZING_MODES))
 total = len(combos)
 
-for i, (alloc, (sizing_label, is_flat), tp_on) in enumerate(combos, 1):
-    tp_tag = "TP" if tp_on else "NoTP"
+for i, (alloc, (sizing_label, is_flat)) in enumerate(combos, 1):
     alloc_label = f"{int(alloc*100)}pct"
-    tp_file_tag = "" if tp_on else "_notp"
 
-    folder = f"0dte_bybit_s3_10x_{alloc_label}_{sizing_label}{tp_file_tag}_output"
+    folder = f"0dte_bybit_s3_10x_{alloc_label}_{sizing_label}_output"
     out_dir = _SCRIPT_DIR / "output" / folder
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[{i}/{total}] 10x {alloc_label} {sizing_label} {tp_tag} ...", flush=True)
+    print(f"[{i}/{total}] 10x {alloc_label} {sizing_label} ...", flush=True)
 
     log = bt.run_backtest(
         df, FEE, float(LEVERAGE),
-        tp_enabled=tp_on,
+        tp_enabled=False,
         session_filter="3",
         alloc_pct=alloc,
         flat_sizing=is_flat,
@@ -77,9 +74,9 @@ for i, (alloc, (sizing_label, is_flat), tp_on) in enumerate(combos, 1):
         print(f"  => No trades\n", flush=True)
         results.append({
             "leverage": "10x", "alloc_pct": int(alloc * 100),
-            "sizing": sizing_label, "tp": tp_tag,
+            "sizing": sizing_label,
             "trades": 0, "return_pct": 0, "sharpe": 0,
-            "max_dd_pct": 0, "win_rate_pct": 0, "tp_hit_rate_pct": 0,
+            "max_dd_pct": 0, "win_rate_pct": 0,
             "liq_rate_pct": 0, "profit_factor": 0, "final_capital": bt.INITIAL_CAPITAL,
             "total_option_contracts": 0, "total_spot_btc_volume": 0,
         })
@@ -112,7 +109,7 @@ for i, (alloc, (sizing_label, is_flat), tp_on) in enumerate(combos, 1):
     monthly_vol.to_csv(out_dir / "monthly_volumes.csv", index=False)
 
     vol_lines = [
-        f"Monthly Volume Report — 10x / {int(alloc*100)}% / {sizing_label} / {tp_tag}",
+        f"Monthly Volume Report — 10x / {int(alloc*100)}% / {sizing_label}",
         f"Position per straddle: {bt.QTY} BTC spot + {bt.NUM_PUTS} puts × {bt.QTY} BTC each",
         f"  Option contracts per straddle: {bt.NUM_PUTS} buy + {bt.NUM_PUTS} sell = {bt.NUM_PUTS*2} contracts (each {bt.QTY} BTC)",
         f"  Spot per straddle: buy {bt.QTY} BTC + sell {bt.QTY} BTC = {bt.QTY*2} BTC",
@@ -144,13 +141,12 @@ for i, (alloc, (sizing_label, is_flat), tp_on) in enumerate(combos, 1):
 
     results.append({
         "leverage": "10x", "alloc_pct": int(alloc * 100),
-        "sizing": sizing_label, "tp": tp_tag,
+        "sizing": sizing_label,
         "trades": overall["total_trades"],
         "return_pct": round(overall["total_return_pct"], 2),
         "sharpe": round(overall["sharpe"], 3),
         "max_dd_pct": round(overall["max_dd_pct"], 2),
         "win_rate_pct": round(overall["win_rate_pct"], 2),
-        "tp_hit_rate_pct": round(overall["tp_hit_rate_pct"], 2),
         "liq_rate_pct": round(overall.get("liq_rate_pct", 0), 2),
         "profit_factor": round(overall["profit_factor"], 3),
         "final_capital": round(overall["total_pnl"] + bt.INITIAL_CAPITAL, 2),
@@ -173,16 +169,16 @@ with open(out_csv, "w", newline="") as f:
     w.writerows(results)
 
 print("\n" + "=" * 110)
-print("BYBIT SPOT 10x SWEEP — S3 SESSION — 0.5 BTC + 1 PUT — $8K START")
+print("BYBIT SPOT 10x SWEEP — S3 SESSION — 0.5 BTC + 2 PUTS — $8K START")
 print("=" * 110)
-hdr = (f"{'Alloc%':>6} {'Sizing':<10} {'TP':<5} {'Trades':>6} {'Return%':>9} {'Sharpe':>7} "
+hdr = (f"{'Alloc%':>6} {'Sizing':<10} {'Trades':>6} {'Return%':>9} {'Sharpe':>7} "
        f"{'MaxDD%':>8} {'WinR%':>6} {'PF':>6} {'Final$':>11} {'OptContr':>9} {'SpotBTC':>9}")
 print(hdr)
 print("-" * 110)
 for r in results:
     opt_c = r.get("total_option_contracts", 0)
     spot_v = r.get("total_spot_btc_volume", 0)
-    print(f"{r['alloc_pct']:>5}% {r['sizing']:<10} {r['tp']:<5} {r['trades']:>6} "
+    print(f"{r['alloc_pct']:>5}% {r['sizing']:<10} {r['trades']:>6} "
           f"{r['return_pct']:>8.1f}% {r['sharpe']:>7.3f} "
           f"{r['max_dd_pct']:>7.1f}% {r['win_rate_pct']:>5.1f}% {r['profit_factor']:>6.3f} "
           f"${r['final_capital']:>9,.0f} {opt_c:>9.0f} {spot_v:>9.1f}")
