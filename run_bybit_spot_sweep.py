@@ -98,38 +98,45 @@ for i, (alloc, (sizing_label, is_flat)) in enumerate(combos, 1):
     # Spot volume: buy QTY BTC (entry) + sell QTY BTC (exit) = 2 × QTY per straddle
     log_copy["spot_btc_traded"] = 2 * bt.QTY * log_copy["num_straddles"]
 
+    log_copy["total_notional_btc"] = log_copy["option_btc_notional"] + log_copy["spot_btc_traded"]
+
     monthly_vol = log_copy.groupby(["year", "month"]).agg(
         trades=("num_straddles", "size"),
         total_straddles=("num_straddles", "sum"),
         option_contracts=("option_contracts_traded", "sum"),
         option_btc_notional=("option_btc_notional", "sum"),
         spot_btc_volume=("spot_btc_traded", "sum"),
+        total_notional_btc=("total_notional_btc", "sum"),
     ).reset_index()
 
     monthly_vol.to_csv(out_dir / "monthly_volumes.csv", index=False)
 
+    notional_per_straddle = bt.NUM_PUTS * bt.QTY * 2 + bt.QTY * 2
     vol_lines = [
         f"Monthly Volume Report — 10x / {int(alloc*100)}% / {sizing_label}",
         f"Position per straddle: {bt.QTY} BTC spot + {bt.NUM_PUTS} puts × {bt.QTY} BTC each",
         f"  Option contracts per straddle: {bt.NUM_PUTS} buy + {bt.NUM_PUTS} sell = {bt.NUM_PUTS*2} contracts (each {bt.QTY} BTC)",
         f"  Spot per straddle: buy {bt.QTY} BTC + sell {bt.QTY} BTC = {bt.QTY*2} BTC",
+        f"  Total notional BTC per straddle: {notional_per_straddle:.1f} BTC (options + spot, round-trip)",
         "",
-        f"{'Month':<10} {'Trades':>7} {'Straddles':>10} {'Opt Contracts':>15} {'Opt BTC':>10} {'Spot BTC':>10}",
-        "-" * 70,
+        f"{'Month':<10} {'Trades':>7} {'Straddles':>10} {'Opt Contracts':>15} {'Opt BTC':>10} {'Spot BTC':>10} {'Total BTC':>10}",
+        "-" * 80,
     ]
     for _, row in monthly_vol.iterrows():
         m_str = f"{int(row['year'])}-{int(row['month']):02d}"
         vol_lines.append(
             f"{m_str:<10} {int(row['trades']):>7} {int(row['total_straddles']):>10} "
-            f"{int(row['option_contracts']):>15} {row['option_btc_notional']:>10.1f} {row['spot_btc_volume']:>10.1f}"
+            f"{int(row['option_contracts']):>15} {row['option_btc_notional']:>10.1f} "
+            f"{row['spot_btc_volume']:>10.1f} {row['total_notional_btc']:>10.1f}"
         )
-    vol_lines.append("-" * 70)
+    vol_lines.append("-" * 80)
     vol_lines.append(
         f"{'TOTAL':<10} {monthly_vol['trades'].sum():>7} "
         f"{monthly_vol['total_straddles'].sum():>10} "
         f"{int(monthly_vol['option_contracts'].sum()):>15} "
         f"{monthly_vol['option_btc_notional'].sum():>10.1f} "
-        f"{monthly_vol['spot_btc_volume'].sum():>10.1f}"
+        f"{monthly_vol['spot_btc_volume'].sum():>10.1f} "
+        f"{monthly_vol['total_notional_btc'].sum():>10.1f}"
     )
     vol_text = "\n".join(vol_lines)
     (out_dir / "monthly_volumes.txt").write_text(vol_text + "\n")
