@@ -98,13 +98,16 @@ for i, (alloc, (sizing_label, is_flat)) in enumerate(combos, 1):
     # Spot volume: buy QTY BTC (entry) + sell QTY BTC (exit) = 2 × QTY per straddle
     log_copy["spot_btc_traded"] = 2 * bt.QTY * log_copy["num_straddles"]
 
-    # USD notional per trade = BTC traded × spot price at time of trade
-    # Entry: (NUM_PUTS + 1) × QTY × num_straddles × spot_entry
-    # Exit:  (NUM_PUTS + 1) × QTY × num_straddles × spot_exit
-    btc_per_leg = (bt.NUM_PUTS + 1) * bt.QTY  # total BTC across all legs per straddle
+    # USD notional split by leg and side
+    opt_btc = bt.NUM_PUTS * bt.QTY  # option BTC per straddle per side
+    spot_btc = bt.QTY               # spot BTC per straddle per side
+    log_copy["opt_usd_entry"] = log_copy["num_straddles"] * opt_btc * log_copy["spot_entry"]
+    log_copy["opt_usd_exit"] = log_copy["num_straddles"] * opt_btc * log_copy["spot_exit"]
+    log_copy["spot_usd_entry"] = log_copy["num_straddles"] * spot_btc * log_copy["spot_entry"]
+    log_copy["spot_usd_exit"] = log_copy["num_straddles"] * spot_btc * log_copy["spot_exit"]
     log_copy["usd_notional"] = (
-        log_copy["num_straddles"] * btc_per_leg * log_copy["spot_entry"]
-        + log_copy["num_straddles"] * btc_per_leg * log_copy["spot_exit"]
+        log_copy["opt_usd_entry"] + log_copy["opt_usd_exit"]
+        + log_copy["spot_usd_entry"] + log_copy["spot_usd_exit"]
     )
 
     monthly_vol = log_copy.groupby(["year", "month"]).agg(
@@ -113,6 +116,10 @@ for i, (alloc, (sizing_label, is_flat)) in enumerate(combos, 1):
         option_contracts=("option_contracts_traded", "sum"),
         option_btc_notional=("option_btc_notional", "sum"),
         spot_btc_volume=("spot_btc_traded", "sum"),
+        opt_usd_entry=("opt_usd_entry", "sum"),
+        opt_usd_exit=("opt_usd_exit", "sum"),
+        spot_usd_entry=("spot_usd_entry", "sum"),
+        spot_usd_exit=("spot_usd_exit", "sum"),
         usd_notional=("usd_notional", "sum"),
     ).reset_index()
 
@@ -121,27 +128,29 @@ for i, (alloc, (sizing_label, is_flat)) in enumerate(combos, 1):
     vol_lines = [
         f"Monthly Volume Report — 10x / {int(alloc*100)}% / {sizing_label}",
         f"Position per straddle: {bt.QTY} BTC spot + {bt.NUM_PUTS} puts × {bt.QTY} BTC each",
-        f"  Option contracts per straddle: {bt.NUM_PUTS} buy + {bt.NUM_PUTS} sell = {bt.NUM_PUTS*2} contracts (each {bt.QTY} BTC)",
-        f"  Spot per straddle: buy {bt.QTY} BTC + sell {bt.QTY} BTC = {bt.QTY*2} BTC",
-        f"  USD notional = BTC qty × spot price at entry + BTC qty × spot price at exit",
+        f"  Option BTC per side: {opt_btc} BTC ({bt.NUM_PUTS} puts × {bt.QTY})",
+        f"  Spot BTC per side:   {spot_btc} BTC",
+        f"  USD notional = BTC qty × spot price, computed at entry and exit separately",
         "",
-        f"{'Month':<10} {'Trades':>7} {'Straddles':>10} {'Opt Contracts':>15} {'Opt BTC':>10} {'Spot BTC':>10} {'USD Notional':>14}",
-        "-" * 85,
+        f"{'Month':<10} {'Trades':>7} {'Straddles':>10} {'Opt$Entry':>13} {'Opt$Exit':>13} {'Spot$Entry':>13} {'Spot$Exit':>13} {'Total USD':>14}",
+        "-" * 105,
     ]
     for _, row in monthly_vol.iterrows():
         m_str = f"{int(row['year'])}-{int(row['month']):02d}"
         vol_lines.append(
             f"{m_str:<10} {int(row['trades']):>7} {int(row['total_straddles']):>10} "
-            f"{int(row['option_contracts']):>15} {row['option_btc_notional']:>10.1f} "
-            f"{row['spot_btc_volume']:>10.1f} ${row['usd_notional']:>12,.0f}"
+            f"${row['opt_usd_entry']:>11,.0f} ${row['opt_usd_exit']:>11,.0f} "
+            f"${row['spot_usd_entry']:>11,.0f} ${row['spot_usd_exit']:>11,.0f} "
+            f"${row['usd_notional']:>12,.0f}"
         )
-    vol_lines.append("-" * 85)
+    vol_lines.append("-" * 105)
     vol_lines.append(
         f"{'TOTAL':<10} {monthly_vol['trades'].sum():>7} "
         f"{monthly_vol['total_straddles'].sum():>10} "
-        f"{int(monthly_vol['option_contracts'].sum()):>15} "
-        f"{monthly_vol['option_btc_notional'].sum():>10.1f} "
-        f"{monthly_vol['spot_btc_volume'].sum():>10.1f} "
+        f"${monthly_vol['opt_usd_entry'].sum():>11,.0f} "
+        f"${monthly_vol['opt_usd_exit'].sum():>11,.0f} "
+        f"${monthly_vol['spot_usd_entry'].sum():>11,.0f} "
+        f"${monthly_vol['spot_usd_exit'].sum():>11,.0f} "
         f"${monthly_vol['usd_notional'].sum():>12,.0f}"
     )
     vol_text = "\n".join(vol_lines)
