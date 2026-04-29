@@ -90,7 +90,11 @@ def parse_args():
     return p.parse_args()
 
 
-def load_data() -> pd.DataFrame:
+def load_data(exchange_filter=None) -> pd.DataFrame:
+    """Load and merge parquet data files.
+
+    exchange_filter : str or None — if set (e.g. "deribit"), keep only that exchange.
+    """
     print("Loading File 1 ...", flush=True)
     df1 = pd.read_parquet(
         DATA_PATH_1,
@@ -130,12 +134,22 @@ def load_data() -> pd.DataFrame:
     df = pd.concat([df1, df2], ignore_index=True)
     del df1, df2
 
+    if exchange_filter:
+        n_pre = len(df)
+        df = df[df["exchange"] == exchange_filter]
+        print(f"  Exchange filter '{exchange_filter}': {n_pre:,} → {len(df):,} rows", flush=True)
+
     df["daystogo"] = pd.to_numeric(df["daystogo"], errors="coerce")
     df = df[df["daystogo"] <= 1.0]
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
     df["spot_price"] = pd.to_numeric(df["spot_price"], errors="coerce")
     df = df.dropna(subset=["premium_usd", "strike", "spot_price"])
     df = df[df["premium_usd"] > 0]
+    n_before = len(df)
+    df = df[df["spot_price"] > 10_000]
+    n_dropped = n_before - len(df)
+    if n_dropped > 0:
+        print(f"  Dropped {n_dropped} rows with corrupt spot_price (<$10K)", flush=True)
     df = df[df["call_put"] == "P"].copy()
 
     df["date"] = df["datetime"].dt.date
@@ -305,6 +319,8 @@ def _process_session(sess_id, entry_time, close_time, half_alloc,
                      fixed_num=None):
     entry_dt = pd.Timestamp(f"{entry_date} {entry_time}:00", tz="UTC")
     close_dt = pd.Timestamp(f"{entry_date} {close_time}:00", tz="UTC")
+    if close_dt <= entry_dt:
+        close_dt += pd.Timedelta(days=1)
 
     entry_snap = _find_nearest_time(put_data, entry_dt, tol_min=5)
     if entry_snap.empty:
@@ -316,6 +332,9 @@ def _process_session(sess_id, entry_time, close_time, half_alloc,
     strike, put_prem, _ = result
     if pd.isna(put_prem) or put_prem <= 0:
         return None
+
+    entry_expiry = entry_snap[entry_snap["strike"] == strike].iloc[0]["expiry_str"]
+    put_data_exp = put_data[put_data["expiry_str"] == entry_expiry]
 
     num, straddle_cost, eff_lev, mm_rate = _compute_sizing(
         capital, spot, put_prem, ivc, half_alloc, target_leverage,
@@ -330,14 +349,14 @@ def _process_session(sess_id, entry_time, close_time, half_alloc,
     entry_cost = spot_margin + put_cost_total
 
     exit_reason, ex_spot, ex_prem, ex_dt = _scan_exit(
-        put_data, strike, entry_dt, close_dt,
+        put_data_exp, strike, entry_dt, close_dt,
         spot, put_prem, num, eff_lev, mm_rate, tp_enabled,
     )
 
     if exit_reason in ("TP", "liquidation"):
         exit_spot, exit_prem, exit_dt_actual = ex_spot, ex_prem, ex_dt
     else:
-        close_result = _find_close_data(put_data, strike, close_dt)
+        close_result = _find_close_data(put_data_exp, strike, close_dt)
         if close_result is None:
             return None
         exit_spot, exit_prem, exit_dt_actual = close_result
@@ -519,6 +538,101 @@ def run_backtest(df, fee_bps, leverage, tp_enabled=False, session_filter="all",
             capital += s3["pnl"]
             s3["capital_after"] = capital
             trades.append(s3)
+
+    print(
+        f"  Completed: {len(trades)} trades, final capital=${capital:,.2f}",
+        flush=True,
+    )
+    return pd.DataFrame(trades)
+
+
+def run_backtest_custom(df, fee_bps, leverage, entry_time, close_time,
+                        day_filter="weekday", tp_enabled=False,
+                        alloc_pct=None, flat_sizing=False, fixed_num=None):
+    """Run a single-session backtest with custom entry/close times and day filter.
+
+    Parameters
+    ----------
+    entry_time : str   e.g. "10:00"
+    close_time : str   e.g. "14:00"
+    day_filter : str   "weekday" (Mon-Fri), "weekend" (Sat-Sun), or "all"
+    """
+    tp_tag = "TP" if tp_enabled else "NoTP"
+    if fixed_num is not None:
+        sizing_tag = f"fixed_{fixed_num}"
+        alloc_tag = "N/A"
+    else:
+        sizing_tag = "flat" if flat_sizing else "compound"
+        alloc_tag = f"{int(alloc_pct*100)}%" if alloc_pct is not None else "IVC"
+    print(
+        f"\nRunning backtest (custom {entry_time}-{close_time} UTC, {day_filter}, "
+        f"leverage={leverage}x, fee={fee_bps}bp, "
+        f"alloc={alloc_tag}, sizing={sizing_tag}, "
+        f"QTY={QTY} BTC, {NUM_PUTS} puts/straddle, {tp_tag}) ...",
+        flush=True,
+    )
+    fee_rate = fee_bps / 10_000.0
+
+    date_groups = dict(list(df.groupby("date")))
+    all_dates = sorted(date_groups.keys())
+
+    if day_filter == "weekday":
+        trading_dates = [d for d in all_dates if pd.Timestamp(d).dayofweek < 5]
+    elif day_filter == "weekend":
+        trading_dates = [d for d in all_dates if pd.Timestamp(d).dayofweek >= 5]
+    else:
+        trading_dates = all_dates
+    print(f"  {day_filter} trading dates: {len(trading_dates)}", flush=True)
+
+    cross_midnight = close_time <= entry_time
+
+    capital = float(INITIAL_CAPITAL)
+    trades = []
+
+    for di, day in enumerate(trading_dates):
+        if di > 0 and di % 100 == 0:
+            print(
+                f"  [{di}/{len(trading_dates)}] capital=${capital:,.2f}  trades={len(trades)}",
+                flush=True,
+            )
+
+        expiry_candidates = _get_expiry_str(day)
+        day_data = date_groups.get(day, pd.DataFrame())
+        if day_data.empty:
+            continue
+
+        if cross_midnight:
+            next_day = day + timedelta(days=1) if hasattr(day, 'day') else (pd.Timestamp(day) + pd.Timedelta(days=1)).date()
+            next_data = date_groups.get(next_day, pd.DataFrame())
+            next_expiry = _get_expiry_str(next_day)
+            all_expiry = list(set(expiry_candidates + next_expiry))
+            combined = pd.concat([day_data, next_data]) if not next_data.empty else day_data
+            exp_data = combined[combined["expiry_str"].isin(all_expiry)]
+        else:
+            exp_data = day_data[day_data["expiry_str"].isin(expiry_candidates)]
+
+        if exp_data.empty:
+            continue
+
+        if alloc_pct is not None:
+            sizing_cap = float(INITIAL_CAPITAL) if flat_sizing else capital
+        else:
+            sizing_cap = None
+
+        ivc = max(IVC_FLOOR, IVC_PCT * capital)
+
+        result = _process_session(
+            1, entry_time, close_time, False, capital, ivc,
+            exp_data, day, fee_rate, leverage,
+            tp_enabled=tp_enabled,
+            alloc_pct=alloc_pct, sizing_capital=sizing_cap,
+            fixed_num=fixed_num,
+        )
+
+        if result:
+            capital += result["pnl"]
+            result["capital_after"] = capital
+            trades.append(result)
 
     print(
         f"  Completed: {len(trades)} trades, final capital=${capital:,.2f}",
