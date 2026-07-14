@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Pure Straddle 0DTE — Detailed Interval Sweep
-==============================================
-Strategy: Long 1 ATM Call + Long 1 ATM Put (options only, no spot/perp)
+Short Pure Straddle 0DTE — Detailed Interval Sweep
+====================================================
+Strategy: Sell 1 ATM Call + Sell 1 ATM Put (options only, no spot/perp)
+Fixed sizing: always 1 straddle (1 BTC notional per leg)
+PnL = premium collected at entry - premium paid to close at exit
+
 Saves individual folders with trade log, metrics, yearly CSV, and plots.
 
-Config: 8K capital, 60%/80% alloc, flat/compound, noTP, 0 fee, Deribit.
-
 Usage:
-  python run_pure_straddle_interval_detailed.py --interval 30 --day-filter weekday
-  python run_pure_straddle_interval_detailed.py --interval 60 --day-filter weekend
-  python run_pure_straddle_interval_detailed.py --interval 120 --day-filter weekday
+  python run_short_straddle_detailed.py --interval 120 --day-filter weekday
+  python run_short_straddle_detailed.py --custom --day-filter weekend
 """
 
 import sys, os, argparse, math, itertools, csv
@@ -33,9 +33,14 @@ DATA_PATH_2 = DATA_DIR / "btc_0dte_data_2026.parquet"
 EXCHANGE = "deribit"
 FEE_BPS = 0
 TP_ENABLED = False
-DEFAULT_CAPITALS = [8_000]
-DEFAULT_ALLOCS = [0.60, 0.80]
-SIZING_MODES = [("flat", True), ("compound", False)]
+INITIAL_CAPITAL = 10_000
+NUM_STRADDLES = 1
+
+CUSTOM_TIMINGS = [
+    ("0900-1000", "09:00", "10:00"),
+    ("1200-1400", "12:00", "14:00"),
+    ("1400-1600", "14:00", "16:00"),
+]
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
 OUT_DIR.mkdir(exist_ok=True)
@@ -118,7 +123,7 @@ def load_data_all(exchange_filter=None):
     df["expiry_str"] = df["expiry_date"].astype(str).str[:10]
 
     start_d = pd.Timestamp("2024-01-01").date()
-    end_d = pd.Timestamp("2026-05-31").date()
+    end_d = pd.Timestamp("2026-03-25").date()
     df = df[(df["date"] >= start_d) & (df["date"] <= end_d)]
 
     print(f"  Final dataset (calls+puts): {len(df):,} rows  ({df['date'].min()} to {df['date'].max()})", flush=True)
@@ -129,8 +134,7 @@ def _get_expiry_str(dt_date):
     return [str(dt_date + timedelta(days=1)), str(dt_date)]
 
 
-def run_pure_straddle(df, entry_time, close_time, day_filter,
-                      initial_capital, alloc_pct, flat_sizing):
+def run_short_straddle(df, entry_time, close_time, day_filter):
     fee_rate = FEE_BPS / 10_000.0
 
     date_groups = dict(list(df.groupby("date")))
@@ -145,10 +149,13 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
 
     cross_midnight = close_time <= entry_time
 
-    equity = float(initial_capital)
+    equity = float(INITIAL_CAPITAL)
     trades = []
 
     for day in trading_dates:
+        if equity <= 0:
+            break
+
         expiry_candidates = _get_expiry_str(day)
         day_data = date_groups.get(day, pd.DataFrame())
         if day_data.empty:
@@ -180,6 +187,7 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
         if both.empty:
             continue
 
+        # Same ATM strike selection as long version: highest strike <= spot
         itm = both[both["strike"] <= spot_entry]
         if not itm.empty:
             row = itm.loc[itm["strike"].idxmax()]
@@ -188,23 +196,12 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
             row = both.loc[both["_d"].idxmin()]
 
         strike = float(row["strike"])
-        call_prem = float(row["premium_usd_c"])
-        put_prem = float(row["premium_usd_p"])
+        call_prem_entry = float(row["premium_usd_c"])
+        put_prem_entry = float(row["premium_usd_p"])
         entry_expiry = row["expiry_str_c"]
-        straddle_cost_usd = call_prem + put_prem
+        premium_collected = call_prem_entry + put_prem_entry
 
-        if straddle_cost_usd <= 0 or equity < straddle_cost_usd:
-            continue
-
-        sizing_capital = float(initial_capital) if flat_sizing else equity
-        allocated = alloc_pct * sizing_capital
-        num_straddles = max(1, int(math.floor(allocated / straddle_cost_usd)))
-
-        total_cost = num_straddles * straddle_cost_usd
-        if total_cost > equity:
-            num_straddles = max(1, int(math.floor(equity / straddle_cost_usd)))
-            total_cost = num_straddles * straddle_cost_usd
-        if total_cost > equity:
+        if premium_collected <= 0:
             continue
 
         exp_data_exp = exp_data[exp_data["expiry_str"].isin([entry_expiry])]
@@ -235,17 +232,18 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
         if ec.empty or ep.empty:
             continue
 
-        exit_call_prem = float(ec["premium_usd"].iloc[0])
-        exit_put_prem = float(ep["premium_usd"].iloc[0])
+        call_prem_exit = float(ec["premium_usd"].iloc[0])
+        put_prem_exit = float(ep["premium_usd"].iloc[0])
         spot_exit = float(ec["spot_price"].iloc[0])
         exit_dt = str(ec["datetime"].iloc[0])
 
-        call_pnl = num_straddles * (exit_call_prem - call_prem)
-        put_pnl = num_straddles * (exit_put_prem - put_prem)
+        # SHORT PnL: premium collected minus premium paid to close
+        call_pnl = NUM_STRADDLES * (call_prem_entry - call_prem_exit)
+        put_pnl = NUM_STRADDLES * (put_prem_entry - put_prem_exit)
         gross_pnl = call_pnl + put_pnl
 
-        entry_fee = num_straddles * 2 * fee_rate * spot_entry
-        exit_fee = num_straddles * 2 * fee_rate * spot_exit
+        entry_fee = NUM_STRADDLES * 2 * fee_rate * spot_entry
+        exit_fee = NUM_STRADDLES * 2 * fee_rate * spot_exit
         total_fees = entry_fee + exit_fee
 
         net_pnl = gross_pnl - total_fees
@@ -259,19 +257,18 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
             "spot_entry": spot_entry,
             "spot_exit": spot_exit,
             "strike": strike,
-            "call_prem_entry": call_prem,
-            "call_prem_exit": exit_call_prem,
-            "put_prem_entry": put_prem,
-            "put_prem_exit": exit_put_prem,
-            "straddle_cost_usd": straddle_cost_usd,
-            "num_straddles": num_straddles,
-            "entry_cost": total_cost,
+            "call_prem_entry": call_prem_entry,
+            "call_prem_exit": call_prem_exit,
+            "put_prem_entry": put_prem_entry,
+            "put_prem_exit": put_prem_exit,
+            "premium_collected": premium_collected,
+            "num_straddles": NUM_STRADDLES,
             "call_pnl": call_pnl,
             "put_pnl": put_pnl,
             "gross_pnl": gross_pnl,
             "fees": total_fees,
             "pnl": net_pnl,
-            "pnl_pct": net_pnl / total_cost if total_cost > 0 else 0,
+            "pnl_pct": net_pnl / premium_collected if premium_collected > 0 else 0,
             "capital_after": equity,
         })
 
@@ -304,7 +301,7 @@ def _segment_metrics(pnl, equity, start_eq):
     }
 
 
-def compute_metrics(log, initial_capital):
+def compute_metrics(log):
     pnl = log["pnl"].values.astype(float)
     equity = log["capital_after"].values.astype(float)
     n = len(log)
@@ -312,8 +309,8 @@ def compute_metrics(log, initial_capital):
         return {}, []
 
     total_pnl = float(np.sum(pnl))
-    total_return_pct = total_pnl / initial_capital * 100.0
-    ann_return = ((1 + total_pnl / initial_capital) ** (252.0 / n) - 1.0) if n > 0 and total_pnl / initial_capital > -1 else float("nan")
+    total_return_pct = total_pnl / INITIAL_CAPITAL * 100.0
+    ann_return = ((1 + total_pnl / INITIAL_CAPITAL) ** (252.0 / n) - 1.0) if n > 0 and total_pnl / INITIAL_CAPITAL > -1 else float("nan")
 
     mu = float(np.mean(pnl))
     sd = float(np.std(pnl, ddof=1)) if n > 1 else 0.0
@@ -362,10 +359,10 @@ def compute_metrics(log, initial_capital):
     return overall, yearly
 
 
-def save_metrics(overall, yearly, out_dir, label, initial_capital):
+def save_metrics(overall, yearly, out_dir, label):
     lines = [
         "=" * 65,
-        f"  Pure Straddle 0DTE — {label}",
+        f"  Short Straddle 0DTE — {label}",
         "=" * 65,
         f"  Total trades:            {overall['total_trades']}",
         f"  Win rate:                {overall['win_rate_pct']:.2f}%",
@@ -398,29 +395,29 @@ def save_metrics(overall, yearly, out_dir, label, initial_capital):
     pd.DataFrame(yearly).to_csv(out_dir / "yearly_metrics.csv", index=False)
 
 
-def generate_plots(log, out_dir, initial_capital):
+def generate_plots(log, out_dir):
     dates = pd.to_datetime(log["date"]).values
     equity = log["capital_after"].values.astype(float)
     pnl = log["pnl"].values.astype(float)
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(dates, equity, linewidth=1.2, color="#2563eb")
-    ax.axhline(initial_capital, color="grey", linestyle="--", alpha=0.5, linewidth=0.8)
-    ax.set_title("Equity Curve (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
+    ax.plot(dates, equity, linewidth=1.2, color="#dc2626")
+    ax.axhline(INITIAL_CAPITAL, color="grey", linestyle="--", alpha=0.5, linewidth=0.8)
+    ax.set_title("Equity Curve (USD) — Short Straddle"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "equity_curve.png", dpi=150); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(14, 5))
     colors = ["#22c55e" if p > 0 else "#ef4444" for p in pnl]
     ax.bar(dates, pnl, color=colors, width=1.0, edgecolor="none")
     ax.axhline(0, color="grey", linewidth=0.5)
-    ax.set_title("Daily PnL (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
+    ax.set_title("Daily PnL (USD) — Short Straddle"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "daily_pnl.png", dpi=150); plt.close(fig)
 
     peaks = np.maximum.accumulate(equity)
     dd_pct = (equity - peaks) / peaks * 100.0
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.fill_between(dates, dd_pct, 0, color="#ef4444", alpha=0.5)
-    ax.set_title("Drawdown (%)"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
+    ax.set_title("Drawdown (%) — Short Straddle"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "drawdown.png", dpi=150); plt.close(fig)
 
     log_dt = log.copy()
@@ -451,7 +448,7 @@ def generate_plots(log, out_dir, initial_capital):
             v = data[yi, mi]
             if np.isfinite(v):
                 ax.text(mi, yi, f"{v:.1f}%", ha="center", va="center", fontsize=8)
-    ax.set_title("Monthly Returns (%)")
+    ax.set_title("Monthly Returns (%) — Short Straddle")
     fig.colorbar(im, ax=ax, fraction=0.02, pad=0.04)
     fig.tight_layout(); fig.savefig(out_dir / "monthly_heatmap.png", dpi=150); plt.close(fig)
 
@@ -459,63 +456,53 @@ def generate_plots(log, out_dir, initial_capital):
     ax.hist(pnl, bins=60, color="#6366f1", edgecolor="white", alpha=0.8)
     ax.axvline(np.mean(pnl), color="#ef4444", linestyle="--", label=f"Mean: ${np.mean(pnl):,.0f}")
     ax.axvline(np.median(pnl), color="#22c55e", linestyle="--", label=f"Median: ${np.median(pnl):,.0f}")
-    ax.legend(); ax.set_title("Daily PnL Distribution")
+    ax.legend(); ax.set_title("Daily PnL Distribution — Short Straddle")
     ax.set_xlabel("PnL ($)"); ax.set_ylabel("Frequency"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "pnl_distribution.png", dpi=150); plt.close(fig)
 
 
-def run_sweep(timings, day_filter, df, interval_label, capitals=None, allocs=None):
-    caps = capitals if capitals is not None else DEFAULT_CAPITALS
-    alcs = allocs if allocs is not None else DEFAULT_ALLOCS
-    combos = list(itertools.product(
-        timings, caps, alcs, SIZING_MODES,
-    ))
-    total = len(combos)
-    print(f"Total configurations: {total}\n", flush=True)
+def run_sweep(timings, day_filter, df, sweep_label):
+    total = len(timings)
+    print(f"Total timing windows: {total}\n", flush=True)
 
     results = []
-    for i, ((tag, entry_t, close_t), cap, alloc, (sz_label, is_flat)) in enumerate(combos, 1):
-        cap_label = f"{cap // 1000}k"
-        alloc_int = int(alloc * 100)
-
-        folder_name = f"pure_straddle_{interval_label}_{day_filter}_{tag}_{cap_label}_{alloc_int}pct_{sz_label}_notp"
+    for i, (tag, entry_t, close_t) in enumerate(timings, 1):
+        cap_label = f"{INITIAL_CAPITAL // 1000}k"
+        folder_name = f"short_straddle_{sweep_label}_{day_filter}_{tag}_{cap_label}_fixed1_notp"
         config_dir = OUT_DIR / folder_name
         config_dir.mkdir(parents=True, exist_ok=True)
 
-        label = f"{day_filter} {tag} ${cap_label} {alloc_int}% {sz_label}"
+        label = f"{day_filter} {tag} ${cap_label} fixed-1"
         print(f"[{i}/{total}] {label}", flush=True)
 
-        log = run_pure_straddle(
-            df, entry_t, close_t, day_filter,
-            initial_capital=cap, alloc_pct=alloc, flat_sizing=is_flat,
-        )
+        log = run_short_straddle(df, entry_t, close_t, day_filter)
 
         if log.empty:
             print(f"  => No trades\n", flush=True)
             results.append({
-                "timing": tag, "capital": cap, "alloc_pct": alloc_int,
-                "sizing": sz_label, "tp": "NoTP", "fee_bps": 0,
+                "timing": tag, "capital": INITIAL_CAPITAL,
+                "sizing": "fixed_1", "tp": "NoTP", "fee_bps": 0,
                 "trades": 0, "return_pct": 0, "sharpe": 0,
                 "max_dd_pct": 0, "win_rate_pct": 0,
-                "profit_factor": 0, "final_capital": cap, "total_fees": 0,
+                "profit_factor": 0, "final_capital": INITIAL_CAPITAL, "total_fees": 0,
             })
             continue
 
         log.to_csv(config_dir / "trade_log.csv", index=False)
-        overall, yearly = compute_metrics(log, cap)
-        save_metrics(overall, yearly, config_dir, label, cap)
-        generate_plots(log, config_dir, cap)
+        overall, yearly = compute_metrics(log)
+        save_metrics(overall, yearly, config_dir, label)
+        generate_plots(log, config_dir)
 
         results.append({
-            "timing": tag, "capital": cap, "alloc_pct": alloc_int,
-            "sizing": sz_label, "tp": "NoTP", "fee_bps": 0,
+            "timing": tag, "capital": INITIAL_CAPITAL,
+            "sizing": "fixed_1", "tp": "NoTP", "fee_bps": 0,
             "trades": overall["total_trades"],
             "return_pct": round(overall["total_return_pct"], 2),
             "sharpe": round(overall["sharpe"], 3),
             "max_dd_pct": round(overall["max_dd_pct"], 2),
             "win_rate_pct": round(overall["win_rate_pct"], 2),
             "profit_factor": round(overall["profit_factor"], 3),
-            "final_capital": round(overall["total_pnl_usd"] + cap, 2),
+            "final_capital": round(overall["total_pnl_usd"] + INITIAL_CAPITAL, 2),
             "total_fees": round(overall["total_fees"], 2),
         })
         print(
@@ -530,35 +517,32 @@ def run_sweep(timings, day_filter, df, interval_label, capitals=None, allocs=Non
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, required=True, choices=[30, 60, 120])
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--interval", type=int, choices=[30, 60, 120],
+                       help="Interval minutes for systematic sweep")
+    group.add_argument("--custom", action="store_true",
+                       help="Run the 3 specific timings (0900-1000, 1200-1400, 1400-1600)")
     parser.add_argument("--day-filter", required=True, choices=["weekday", "weekend"])
     parser.add_argument("--start", type=str, default="0830",
-                        help="Start time HHMM (default 0830)")
-    parser.add_argument("--capital", type=int, nargs="+", default=None,
-                        help="Starting capital(s), e.g. --capital 20000")
-    parser.add_argument("--alloc", type=int, nargs="+", default=None,
-                        help="Allocation percent(s), e.g. --alloc 40")
+                        help="Start time HHMM for interval mode (default 0830)")
     args = parser.parse_args()
 
-    interval_min = args.interval
     day_filter = args.day_filter
-    start_hh = int(args.start[:2])
-    start_mm = int(args.start[2:])
-    timings = _build_timings(interval_min, start_hh, start_mm)
-    start_tag = f"s{args.start}" if args.start != "0830" else ""
-    int_label = f"{interval_min}min{start_tag}"
 
-    capitals = args.capital if args.capital else [c for c in DEFAULT_CAPITALS]
-    allocs = [a / 100.0 for a in args.alloc] if args.alloc else list(DEFAULT_ALLOCS)
+    if args.custom:
+        timings = CUSTOM_TIMINGS
+        sweep_label = "custom"
+    else:
+        start_hh = int(args.start[:2])
+        start_mm = int(args.start[2:])
+        timings = _build_timings(args.interval, start_hh, start_mm)
+        start_tag = f"s{args.start}" if args.start != "0830" else ""
+        sweep_label = f"{args.interval}min{start_tag}"
 
-    cap_tag = "_".join(f"{c // 1000}k" for c in capitals)
-    alloc_tag = "_".join(f"{int(a * 100)}pct" for a in allocs)
-
-    print(f"=== Pure Straddle Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
+    print(f"=== Short Straddle Detailed Sweep: {sweep_label}, {day_filter} ===", flush=True)
     print(f"Windows: {len(timings)}", flush=True)
-    print(f"Capitals: {capitals}", flush=True)
-    print(f"Allocations: {[int(a*100) for a in allocs]}%", flush=True)
-    print(f"Sizing: {[s[0] for s in SIZING_MODES]}", flush=True)
+    print(f"Capital: ${INITIAL_CAPITAL:,}", flush=True)
+    print(f"Sizing: fixed {NUM_STRADDLES} straddle(s) (1 BTC notional)", flush=True)
     print(f"TP: {TP_ENABLED}, Fee: {FEE_BPS}bps, Day filter: {day_filter}", flush=True)
     print(f"Exchange: {EXCHANGE}\n", flush=True)
 
@@ -566,9 +550,9 @@ def main():
     df = load_data_all(exchange_filter=EXCHANGE)
     print("Data loaded.\n", flush=True)
 
-    results = run_sweep(timings, day_filter, df, int_label, capitals=capitals, allocs=allocs)
+    results = run_sweep(timings, day_filter, df, sweep_label)
 
-    out_csv = OUT_DIR / f"pure_straddle_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
+    out_csv = OUT_DIR / f"short_straddle_{sweep_label}_{day_filter}_detailed_results.csv"
     if results:
         keys = results[0].keys()
         with open(out_csv, "w", newline="") as f:

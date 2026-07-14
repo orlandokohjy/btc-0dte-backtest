@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Pure Straddle 0DTE — Detailed Interval Sweep
-==============================================
+ETH Pure Straddle 0DTE — Detailed Interval Sweep
+==================================================
 Strategy: Long 1 ATM Call + Long 1 ATM Put (options only, no spot/perp)
-Saves individual folders with trade log, metrics, yearly CSV, and plots.
-
-Config: 8K capital, 60%/80% alloc, flat/compound, noTP, 0 fee, Deribit.
+Adapted from BTC pure straddle script for ETH data (monthly parquets).
 
 Usage:
-  python run_pure_straddle_interval_detailed.py --interval 30 --day-filter weekday
-  python run_pure_straddle_interval_detailed.py --interval 60 --day-filter weekend
-  python run_pure_straddle_interval_detailed.py --interval 120 --day-filter weekday
+  python run_eth_pure_straddle_interval_detailed.py --interval 30 --day-filter weekday
+  python run_eth_pure_straddle_interval_detailed.py --interval 60 --day-filter weekend --start 0900
+  python run_eth_pure_straddle_interval_detailed.py --interval 120 --day-filter weekday --capital 10000 --alloc 50
 """
 
-import sys, os, argparse, math, itertools, csv
+import sys, os, argparse, math, itertools, csv, glob
 from pathlib import Path
 from datetime import timedelta
 
@@ -26,15 +24,13 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("BTC_DATA_DIR", str(_SCRIPT_DIR / "data")))
-DATA_PATH_1 = DATA_DIR / "btc_0dte_data.parquet"
-DATA_PATH_2 = DATA_DIR / "btc_0dte_data_2026.parquet"
+ETH_DATA_DIR = Path(os.environ.get("ETH_DATA_DIR", "/Users/jiayikoh/Downloads/ETH_data"))
 
 EXCHANGE = "deribit"
 FEE_BPS = 0
 TP_ENABLED = False
-DEFAULT_CAPITALS = [8_000]
-DEFAULT_ALLOCS = [0.60, 0.80]
+DEFAULT_CAPITALS = [10_000]
+DEFAULT_ALLOCS = [0.50]
 SIZING_MODES = [("flat", True), ("compound", False)]
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
@@ -59,67 +55,56 @@ def _build_timings(interval_min, start_hh=8, start_mm=30):
     return timings
 
 
-def load_data_all(exchange_filter=None):
-    """Load both calls and puts."""
-    print("Loading File 1 ...", flush=True)
-    df1 = pd.read_parquet(
-        DATA_PATH_1,
-        columns=["datetime", "expiry_date", "strike", "call_put",
-                 "spot_price", "mark_price", "daystogo", "exchange"],
-    )
-    df1["datetime"] = pd.to_datetime(df1["datetime"], utc=True)
-    df1.rename(columns={"mark_price": "premium"}, inplace=True)
-    df1["premium_usd"] = (
-        pd.to_numeric(df1["premium"], errors="coerce")
-        * pd.to_numeric(df1["spot_price"], errors="coerce")
-    )
-    print(f"  File 1: {len(df1):,} rows", flush=True)
+def load_eth_data(exchange_filter=None):
+    """Load all monthly ETH parquet files."""
+    files = sorted(glob.glob(str(ETH_DATA_DIR / "eth_0dte_*.parquet")))
+    if not files:
+        raise FileNotFoundError(f"No ETH parquet files found in {ETH_DATA_DIR}")
 
-    print("Loading File 2 ...", flush=True)
-    df2 = pd.read_parquet(
-        DATA_PATH_2,
-        columns=["datetime", "expiry_date", "strike", "call_put",
-                 "spot_price", "premium", "daystogo", "exchange"],
-    )
-    df2["datetime"] = pd.to_datetime(df2["datetime"], utc=True)
-    df2["spot_price"] = pd.to_numeric(df2["spot_price"], errors="coerce")
-    df2["premium"] = pd.to_numeric(df2["premium"], errors="coerce")
+    print(f"Loading {len(files)} ETH parquet files ...", flush=True)
+    dfs = []
+    for f in files:
+        chunk = pd.read_parquet(
+            f,
+            columns=["datetime", "expiry_date", "strike", "call_put",
+                     "spot_price", "premium", "daystogo", "exchange"],
+        )
+        dfs.append(chunk)
+        print(f"  {Path(f).name}: {len(chunk):,} rows", flush=True)
 
-    usd_mask = df2["exchange"].isin(["bybit", "binance"])
-    btc_mask = ~usd_mask
-    df2["premium_usd"] = 0.0
-    df2.loc[usd_mask, "premium_usd"] = df2.loc[usd_mask, "premium"]
-    df2.loc[btc_mask, "premium_usd"] = (
-        df2.loc[btc_mask, "premium"] * df2.loc[btc_mask, "spot_price"]
-    )
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    print(f"  Combined: {len(df):,} rows", flush=True)
 
-    overlap_ts = pd.Timestamp("2026-01-22", tz="UTC")
-    df2 = df2[df2["datetime"] > overlap_ts]
-    print(f"  File 2 after overlap removal: {len(df2):,} rows", flush=True)
-
-    df = pd.concat([df1, df2], ignore_index=True)
-    del df1, df2
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df["spot_price"] = pd.to_numeric(df["spot_price"], errors="coerce")
+    df["premium"] = pd.to_numeric(df["premium"], errors="coerce")
 
     if exchange_filter:
         n_pre = len(df)
         df = df[df["exchange"] == exchange_filter]
         print(f"  Exchange filter '{exchange_filter}': {n_pre:,} → {len(df):,} rows", flush=True)
 
+    # Premium conversion: Deribit premium is in ETH, needs * spot_price for USD
+    # Bybit/Binance premium is already in USD
+    usd_mask = df["exchange"].isin(["bybit", "binance"])
+    btc_mask = ~usd_mask
+    df["premium_usd"] = 0.0
+    df.loc[usd_mask, "premium_usd"] = df.loc[usd_mask, "premium"]
+    df.loc[btc_mask, "premium_usd"] = (
+        df.loc[btc_mask, "premium"] * df.loc[btc_mask, "spot_price"]
+    )
+
     df["daystogo"] = pd.to_numeric(df["daystogo"], errors="coerce")
     df = df[df["daystogo"] <= 1.0]
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-    df["spot_price"] = pd.to_numeric(df["spot_price"], errors="coerce")
     df = df.dropna(subset=["premium_usd", "strike", "spot_price"])
     df = df[df["premium_usd"] > 0]
-    df = df[df["spot_price"] > 10_000]
+    df = df[df["spot_price"] > 100]
 
     df["date"] = df["datetime"].dt.date
     df["time_utc"] = df["datetime"].dt.strftime("%H:%M")
     df["expiry_str"] = df["expiry_date"].astype(str).str[:10]
-
-    start_d = pd.Timestamp("2024-01-01").date()
-    end_d = pd.Timestamp("2026-05-31").date()
-    df = df[(df["date"] >= start_d) & (df["date"] <= end_d)]
 
     print(f"  Final dataset (calls+puts): {len(df):,} rows  ({df['date'].min()} to {df['date'].max()})", flush=True)
     return df
@@ -149,6 +134,9 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
     trades = []
 
     for day in trading_dates:
+        if equity <= 0:
+            break
+
         expiry_candidates = _get_expiry_str(day)
         day_data = date_groups.get(day, pd.DataFrame())
         if day_data.empty:
@@ -180,6 +168,7 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
         if both.empty:
             continue
 
+        # ATM strike: highest strike <= spot (ITM call, OTM put)
         itm = both[both["strike"] <= spot_entry]
         if not itm.empty:
             row = itm.loc[itm["strike"].idxmax()]
@@ -365,7 +354,7 @@ def compute_metrics(log, initial_capital):
 def save_metrics(overall, yearly, out_dir, label, initial_capital):
     lines = [
         "=" * 65,
-        f"  Pure Straddle 0DTE — {label}",
+        f"  ETH Pure Straddle 0DTE — {label}",
         "=" * 65,
         f"  Total trades:            {overall['total_trades']}",
         f"  Win rate:                {overall['win_rate_pct']:.2f}%",
@@ -406,21 +395,21 @@ def generate_plots(log, out_dir, initial_capital):
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(dates, equity, linewidth=1.2, color="#2563eb")
     ax.axhline(initial_capital, color="grey", linestyle="--", alpha=0.5, linewidth=0.8)
-    ax.set_title("Equity Curve (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
+    ax.set_title("ETH Equity Curve (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "equity_curve.png", dpi=150); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(14, 5))
     colors = ["#22c55e" if p > 0 else "#ef4444" for p in pnl]
     ax.bar(dates, pnl, color=colors, width=1.0, edgecolor="none")
     ax.axhline(0, color="grey", linewidth=0.5)
-    ax.set_title("Daily PnL (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
+    ax.set_title("ETH Daily PnL (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "daily_pnl.png", dpi=150); plt.close(fig)
 
     peaks = np.maximum.accumulate(equity)
     dd_pct = (equity - peaks) / peaks * 100.0
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.fill_between(dates, dd_pct, 0, color="#ef4444", alpha=0.5)
-    ax.set_title("Drawdown (%)"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
+    ax.set_title("ETH Drawdown (%)"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "drawdown.png", dpi=150); plt.close(fig)
 
     log_dt = log.copy()
@@ -451,7 +440,7 @@ def generate_plots(log, out_dir, initial_capital):
             v = data[yi, mi]
             if np.isfinite(v):
                 ax.text(mi, yi, f"{v:.1f}%", ha="center", va="center", fontsize=8)
-    ax.set_title("Monthly Returns (%)")
+    ax.set_title("ETH Monthly Returns (%)")
     fig.colorbar(im, ax=ax, fraction=0.02, pad=0.04)
     fig.tight_layout(); fig.savefig(out_dir / "monthly_heatmap.png", dpi=150); plt.close(fig)
 
@@ -459,7 +448,7 @@ def generate_plots(log, out_dir, initial_capital):
     ax.hist(pnl, bins=60, color="#6366f1", edgecolor="white", alpha=0.8)
     ax.axvline(np.mean(pnl), color="#ef4444", linestyle="--", label=f"Mean: ${np.mean(pnl):,.0f}")
     ax.axvline(np.median(pnl), color="#22c55e", linestyle="--", label=f"Median: ${np.median(pnl):,.0f}")
-    ax.legend(); ax.set_title("Daily PnL Distribution")
+    ax.legend(); ax.set_title("ETH Daily PnL Distribution")
     ax.set_xlabel("PnL ($)"); ax.set_ylabel("Frequency"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "pnl_distribution.png", dpi=150); plt.close(fig)
 
@@ -478,7 +467,7 @@ def run_sweep(timings, day_filter, df, interval_label, capitals=None, allocs=Non
         cap_label = f"{cap // 1000}k"
         alloc_int = int(alloc * 100)
 
-        folder_name = f"pure_straddle_{interval_label}_{day_filter}_{tag}_{cap_label}_{alloc_int}pct_{sz_label}_notp"
+        folder_name = f"eth_pure_straddle_{interval_label}_{day_filter}_{tag}_{cap_label}_{alloc_int}pct_{sz_label}_notp"
         config_dir = OUT_DIR / folder_name
         config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -535,9 +524,9 @@ def main():
     parser.add_argument("--start", type=str, default="0830",
                         help="Start time HHMM (default 0830)")
     parser.add_argument("--capital", type=int, nargs="+", default=None,
-                        help="Starting capital(s), e.g. --capital 20000")
+                        help="Starting capital(s), e.g. --capital 10000")
     parser.add_argument("--alloc", type=int, nargs="+", default=None,
-                        help="Allocation percent(s), e.g. --alloc 40")
+                        help="Allocation percent(s), e.g. --alloc 50")
     args = parser.parse_args()
 
     interval_min = args.interval
@@ -548,13 +537,13 @@ def main():
     start_tag = f"s{args.start}" if args.start != "0830" else ""
     int_label = f"{interval_min}min{start_tag}"
 
-    capitals = args.capital if args.capital else [c for c in DEFAULT_CAPITALS]
+    capitals = args.capital if args.capital else list(DEFAULT_CAPITALS)
     allocs = [a / 100.0 for a in args.alloc] if args.alloc else list(DEFAULT_ALLOCS)
 
     cap_tag = "_".join(f"{c // 1000}k" for c in capitals)
     alloc_tag = "_".join(f"{int(a * 100)}pct" for a in allocs)
 
-    print(f"=== Pure Straddle Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
+    print(f"=== ETH Pure Straddle Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
     print(f"Windows: {len(timings)}", flush=True)
     print(f"Capitals: {capitals}", flush=True)
     print(f"Allocations: {[int(a*100) for a in allocs]}%", flush=True)
@@ -562,13 +551,13 @@ def main():
     print(f"TP: {TP_ENABLED}, Fee: {FEE_BPS}bps, Day filter: {day_filter}", flush=True)
     print(f"Exchange: {EXCHANGE}\n", flush=True)
 
-    print("Loading data (deribit only, calls+puts) ...", flush=True)
-    df = load_data_all(exchange_filter=EXCHANGE)
+    print("Loading ETH data (deribit only, calls+puts) ...", flush=True)
+    df = load_eth_data(exchange_filter=EXCHANGE)
     print("Data loaded.\n", flush=True)
 
     results = run_sweep(timings, day_filter, df, int_label, capitals=capitals, allocs=allocs)
 
-    out_csv = OUT_DIR / f"pure_straddle_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
+    out_csv = OUT_DIR / f"eth_pure_straddle_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
     if results:
         keys = results[0].keys()
         with open(out_csv, "w", newline="") as f:

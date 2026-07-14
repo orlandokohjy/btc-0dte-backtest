@@ -6,7 +6,7 @@ Position per straddle unit:
   0.5 BTC spot (10x leverage) + 1 BTC notional in puts (NUM_PUTS=2 × QTY=0.5)
   = half the original 1 BTC perp + 2 BTC puts structure
 
-Initial capital: $8,000
+Initial capital: $10,000
 Session: S3 (14:00–18:00 UTC)
 Sweep: 9 allocations × 2 sizing × 2 TP × 1 fee = 36 variants
 """
@@ -28,7 +28,7 @@ bt = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bt)
 
 # Patch module constants for Bybit spot setup
-bt.INITIAL_CAPITAL = 8_000
+bt.INITIAL_CAPITAL = 10_000
 bt.QTY = 0.5           # 0.5 BTC spot per straddle
 bt.NUM_PUTS = 2         # NUM_PUTS * QTY = 1.0 BTC of put notional per straddle
 
@@ -45,10 +45,10 @@ df = bt.load_data(exchange_filter="deribit")
 print("Data loaded.\n", flush=True)
 
 LEVERAGE = 10
-ALLOCS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+ALLOCS = [0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
 SIZING_MODES = [("flat", True), ("compound", False)]
 TP_MODES = [("TP", True), ("NoTP", False)]
-FEE = 0
+FEE = 0.5 / 3  # net 0.5bps per side across all 3 legs
 
 results = []
 combos = list(itertools.product(ALLOCS, SIZING_MODES, TP_MODES))
@@ -58,7 +58,7 @@ for i, (alloc, (sizing_label, is_flat), (tp_tag, tp_on)) in enumerate(combos, 1)
     alloc_label = f"{int(alloc*100)}pct"
     tp_file_tag = "" if tp_on else "_notp"
 
-    folder = f"0dte_bybit_s3_10x_{alloc_label}_{sizing_label}{tp_file_tag}_output"
+    folder = f"0dte_bybit10k_s3_10x_{alloc_label}_{sizing_label}{tp_file_tag}_0.5bp_output"
     out_dir = _SCRIPT_DIR / "output" / folder
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,7 +189,7 @@ for i, (alloc, (sizing_label, is_flat), (tp_tag, tp_on)) in enumerate(combos, 1)
           flush=True)
 
 # Save summary
-out_csv = _SCRIPT_DIR / "output" / "bybit_spot_sweep_results.csv"
+out_csv = _SCRIPT_DIR / "output" / "bybit10k_spot_sweep_0.5bp_results.csv"
 keys = results[0].keys()
 with open(out_csv, "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=keys)
@@ -197,7 +197,7 @@ with open(out_csv, "w", newline="") as f:
     w.writerows(results)
 
 print("\n" + "=" * 110)
-print("BYBIT SPOT 10x SWEEP — S3 SESSION — 0.5 BTC + 2 PUTS — $8K START")
+print("BYBIT SPOT 10x SWEEP — S3 SESSION — 0.5 BTC + 2 PUTS — $10K START — NET 0.5bp FEE")
 print("=" * 110)
 hdr = (f"{'Alloc%':>6} {'Sizing':<10} {'TP':<5} {'Trades':>6} {'Return%':>9} {'Sharpe':>7} "
        f"{'MaxDD%':>8} {'WinR%':>6} {'PF':>6} {'Final$':>11} {'OptContr':>9} {'SpotBTC':>9}")

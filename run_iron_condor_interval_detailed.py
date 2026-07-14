@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Pure Straddle 0DTE — Detailed Interval Sweep
-==============================================
-Strategy: Long 1 ATM Call + Long 1 ATM Put (options only, no spot/perp)
-Saves individual folders with trade log, metrics, yearly CSV, and plots.
-
-Config: 8K capital, 60%/80% alloc, flat/compound, noTP, 0 fee, Deribit.
+Iron Condor 0DTE — Detailed Interval Sweep
+============================================
+Strategy: Buy ATM Straddle + Sell OTM Wings
+  - Buy 1 ATM Call + Buy 1 ATM Put  (long straddle at ATM)
+  - Sell 1 Put at next strike below ATM  (short put wing, 1 strike down)
+  - Sell 1 Call at 2nd strike above ATM  (short call wing, 2 strikes up)
 
 Usage:
-  python run_pure_straddle_interval_detailed.py --interval 30 --day-filter weekday
-  python run_pure_straddle_interval_detailed.py --interval 60 --day-filter weekend
-  python run_pure_straddle_interval_detailed.py --interval 120 --day-filter weekday
+  python run_iron_condor_interval_detailed.py --interval 30 --day-filter weekday
+  python run_iron_condor_interval_detailed.py --interval 60 --day-filter weekend --start 0900
 """
 
 import sys, os, argparse, math, itertools, csv
@@ -33,8 +32,8 @@ DATA_PATH_2 = DATA_DIR / "btc_0dte_data_2026.parquet"
 EXCHANGE = "deribit"
 FEE_BPS = 0
 TP_ENABLED = False
-DEFAULT_CAPITALS = [8_000]
-DEFAULT_ALLOCS = [0.60, 0.80]
+DEFAULT_CAPITALS = [10_000]
+DEFAULT_ALLOCS = [0.50]
 SIZING_MODES = [("flat", True), ("compound", False)]
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
@@ -60,7 +59,7 @@ def _build_timings(interval_min, start_hh=8, start_mm=30):
 
 
 def load_data_all(exchange_filter=None):
-    """Load both calls and puts."""
+    """Load both calls and puts from 0DTE parquet files."""
     print("Loading File 1 ...", flush=True)
     df1 = pd.read_parquet(
         DATA_PATH_1,
@@ -103,7 +102,7 @@ def load_data_all(exchange_filter=None):
     if exchange_filter:
         n_pre = len(df)
         df = df[df["exchange"] == exchange_filter]
-        print(f"  Exchange filter '{exchange_filter}': {n_pre:,} → {len(df):,} rows", flush=True)
+        print(f"  Exchange filter '{exchange_filter}': {n_pre:,} -> {len(df):,} rows", flush=True)
 
     df["daystogo"] = pd.to_numeric(df["daystogo"], errors="coerce")
     df = df[df["daystogo"] <= 1.0]
@@ -129,8 +128,8 @@ def _get_expiry_str(dt_date):
     return [str(dt_date + timedelta(days=1)), str(dt_date)]
 
 
-def run_pure_straddle(df, entry_time, close_time, day_filter,
-                      initial_capital, alloc_pct, flat_sizing):
+def run_iron_condor(df, entry_time, close_time, day_filter,
+                    initial_capital, alloc_pct, flat_sizing):
     fee_rate = FEE_BPS / 10_000.0
 
     date_groups = dict(list(df.groupby("date")))
@@ -149,6 +148,9 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
     trades = []
 
     for day in trading_dates:
+        if equity <= 0:
+            break
+
         expiry_candidates = _get_expiry_str(day)
         day_data = date_groups.get(day, pd.DataFrame())
         if day_data.empty:
@@ -180,72 +182,117 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
         if both.empty:
             continue
 
+        # ATM strike: highest strike <= spot
         itm = both[both["strike"] <= spot_entry]
         if not itm.empty:
-            row = itm.loc[itm["strike"].idxmax()]
+            atm_row = itm.loc[itm["strike"].idxmax()]
         else:
             both["_d"] = (both["strike"] - spot_entry).abs()
-            row = both.loc[both["_d"].idxmin()]
+            atm_row = both.loc[both["_d"].idxmin()]
 
-        strike = float(row["strike"])
-        call_prem = float(row["premium_usd_c"])
-        put_prem = float(row["premium_usd_p"])
-        entry_expiry = row["expiry_str_c"]
-        straddle_cost_usd = call_prem + put_prem
+        atm_strike = float(atm_row["strike"])
+        long_call_prem = float(atm_row["premium_usd_c"])
+        long_put_prem = float(atm_row["premium_usd_p"])
+        entry_expiry = atm_row["expiry_str_c"]
 
-        if straddle_cost_usd <= 0 or equity < straddle_cost_usd:
+        # --- Find short wings ---
+        all_strikes = sorted(both["strike"].unique())
+        atm_idx = all_strikes.index(atm_strike)
+
+        # Short put: 1st strike below ATM
+        if atm_idx < 1:
+            continue
+        short_put_strike = all_strikes[atm_idx - 1]
+
+        # Short call: 2nd strike above ATM
+        if atm_idx + 2 >= len(all_strikes):
+            continue
+        short_call_strike = all_strikes[atm_idx + 2]
+
+        short_put_row = both[both["strike"] == short_put_strike]
+        short_call_row = both[both["strike"] == short_call_strike]
+        if short_put_row.empty or short_call_row.empty:
+            continue
+
+        short_put_prem = float(short_put_row["premium_usd_p"].iloc[0])
+        short_call_prem = float(short_call_row["premium_usd_c"].iloc[0])
+
+        # Net debit = long premiums - short premiums
+        net_debit = (long_call_prem + long_put_prem) - (short_call_prem + short_put_prem)
+        if net_debit <= 0:
+            continue
+
+        if equity < net_debit:
             continue
 
         sizing_capital = float(initial_capital) if flat_sizing else equity
         allocated = alloc_pct * sizing_capital
-        num_straddles = max(1, int(math.floor(allocated / straddle_cost_usd)))
+        num_units = max(1, int(math.floor(allocated / net_debit)))
 
-        total_cost = num_straddles * straddle_cost_usd
+        total_cost = num_units * net_debit
         if total_cost > equity:
-            num_straddles = max(1, int(math.floor(equity / straddle_cost_usd)))
-            total_cost = num_straddles * straddle_cost_usd
+            num_units = max(1, int(math.floor(equity / net_debit)))
+            total_cost = num_units * net_debit
         if total_cost > equity:
             continue
 
+        # --- Find exit prices for all 4 strikes ---
         exp_data_exp = exp_data[exp_data["expiry_str"].isin([entry_expiry])]
+        all_4_strikes = [atm_strike, short_put_strike, short_call_strike]
 
         exit_snap = exp_data_exp[
-            (exp_data_exp["strike"] == strike) & (exp_data_exp["time_utc"] == close_time)
+            (exp_data_exp["strike"].isin(all_4_strikes)) &
+            (exp_data_exp["time_utc"] == close_time)
         ]
         if exit_snap.empty:
-            before = exp_data_exp[
-                (exp_data_exp["strike"] == strike) & (exp_data_exp["time_utc"] <= close_time)
-            ]
             if cross_midnight:
                 after_midnight = exp_data_exp[
-                    (exp_data_exp["strike"] == strike) &
+                    (exp_data_exp["strike"].isin(all_4_strikes)) &
                     (exp_data_exp["datetime"] > pd.Timestamp(f"{day} {entry_time}:00", tz="UTC")) &
                     (exp_data_exp["datetime"] <= pd.Timestamp(f"{day} {entry_time}:00", tz="UTC") + pd.Timedelta(hours=24))
                 ]
                 if not after_midnight.empty:
-                    exit_snap = after_midnight[after_midnight["datetime"] == after_midnight["datetime"].max()]
-            elif not before.empty:
-                exit_snap = before[before["time_utc"] == before["time_utc"].max()]
+                    max_dt = after_midnight["datetime"].max()
+                    exit_snap = after_midnight[after_midnight["datetime"] == max_dt]
+            else:
+                before = exp_data_exp[
+                    (exp_data_exp["strike"].isin(all_4_strikes)) &
+                    (exp_data_exp["time_utc"] <= close_time)
+                ]
+                if not before.empty:
+                    max_time = before["time_utc"].max()
+                    exit_snap = before[before["time_utc"] == max_time]
 
         if exit_snap.empty:
             continue
 
-        ec = exit_snap[exit_snap["call_put"] == "C"]
-        ep = exit_snap[exit_snap["call_put"] == "P"]
-        if ec.empty or ep.empty:
+        # Extract exit premiums for all 4 legs
+        exit_long_call = exit_snap[(exit_snap["strike"] == atm_strike) & (exit_snap["call_put"] == "C")]
+        exit_long_put = exit_snap[(exit_snap["strike"] == atm_strike) & (exit_snap["call_put"] == "P")]
+        exit_short_put = exit_snap[(exit_snap["strike"] == short_put_strike) & (exit_snap["call_put"] == "P")]
+        exit_short_call = exit_snap[(exit_snap["strike"] == short_call_strike) & (exit_snap["call_put"] == "C")]
+
+        if exit_long_call.empty or exit_long_put.empty or exit_short_put.empty or exit_short_call.empty:
             continue
 
-        exit_call_prem = float(ec["premium_usd"].iloc[0])
-        exit_put_prem = float(ep["premium_usd"].iloc[0])
-        spot_exit = float(ec["spot_price"].iloc[0])
-        exit_dt = str(ec["datetime"].iloc[0])
+        exit_long_call_prem = float(exit_long_call["premium_usd"].iloc[0])
+        exit_long_put_prem = float(exit_long_put["premium_usd"].iloc[0])
+        exit_short_put_prem = float(exit_short_put["premium_usd"].iloc[0])
+        exit_short_call_prem = float(exit_short_call["premium_usd"].iloc[0])
+        spot_exit = float(exit_long_call["spot_price"].iloc[0])
+        exit_dt = str(exit_long_call["datetime"].iloc[0])
 
-        call_pnl = num_straddles * (exit_call_prem - call_prem)
-        put_pnl = num_straddles * (exit_put_prem - put_prem)
-        gross_pnl = call_pnl + put_pnl
+        # PnL per unit
+        long_call_pnl = exit_long_call_prem - long_call_prem
+        long_put_pnl = exit_long_put_prem - long_put_prem
+        short_put_pnl = short_put_prem - exit_short_put_prem
+        short_call_pnl = short_call_prem - exit_short_call_prem
 
-        entry_fee = num_straddles * 2 * fee_rate * spot_entry
-        exit_fee = num_straddles * 2 * fee_rate * spot_exit
+        unit_pnl = long_call_pnl + long_put_pnl + short_put_pnl + short_call_pnl
+        gross_pnl = num_units * unit_pnl
+
+        entry_fee = num_units * 4 * fee_rate * spot_entry
+        exit_fee = num_units * 4 * fee_rate * spot_exit
         total_fees = entry_fee + exit_fee
 
         net_pnl = gross_pnl - total_fees
@@ -258,16 +305,24 @@ def run_pure_straddle(df, entry_time, close_time, day_filter,
             "exit_reason": "hard_close",
             "spot_entry": spot_entry,
             "spot_exit": spot_exit,
-            "strike": strike,
-            "call_prem_entry": call_prem,
-            "call_prem_exit": exit_call_prem,
-            "put_prem_entry": put_prem,
-            "put_prem_exit": exit_put_prem,
-            "straddle_cost_usd": straddle_cost_usd,
-            "num_straddles": num_straddles,
+            "atm_strike": atm_strike,
+            "short_put_strike": short_put_strike,
+            "short_call_strike": short_call_strike,
+            "long_call_prem_entry": long_call_prem,
+            "long_call_prem_exit": exit_long_call_prem,
+            "long_put_prem_entry": long_put_prem,
+            "long_put_prem_exit": exit_long_put_prem,
+            "short_put_prem_entry": short_put_prem,
+            "short_put_prem_exit": exit_short_put_prem,
+            "short_call_prem_entry": short_call_prem,
+            "short_call_prem_exit": exit_short_call_prem,
+            "net_debit_per_unit": net_debit,
+            "num_units": num_units,
             "entry_cost": total_cost,
-            "call_pnl": call_pnl,
-            "put_pnl": put_pnl,
+            "long_call_pnl": num_units * long_call_pnl,
+            "long_put_pnl": num_units * long_put_pnl,
+            "short_put_pnl": num_units * short_put_pnl,
+            "short_call_pnl": num_units * short_call_pnl,
             "gross_pnl": gross_pnl,
             "fees": total_fees,
             "pnl": net_pnl,
@@ -313,7 +368,6 @@ def compute_metrics(log, initial_capital):
 
     total_pnl = float(np.sum(pnl))
     total_return_pct = total_pnl / initial_capital * 100.0
-    ann_return = ((1 + total_pnl / initial_capital) ** (252.0 / n) - 1.0) if n > 0 and total_pnl / initial_capital > -1 else float("nan")
 
     mu = float(np.mean(pnl))
     sd = float(np.std(pnl, ddof=1)) if n > 1 else 0.0
@@ -365,7 +419,7 @@ def compute_metrics(log, initial_capital):
 def save_metrics(overall, yearly, out_dir, label, initial_capital):
     lines = [
         "=" * 65,
-        f"  Pure Straddle 0DTE — {label}",
+        f"  Iron Condor 0DTE — {label}",
         "=" * 65,
         f"  Total trades:            {overall['total_trades']}",
         f"  Win rate:                {overall['win_rate_pct']:.2f}%",
@@ -406,21 +460,21 @@ def generate_plots(log, out_dir, initial_capital):
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(dates, equity, linewidth=1.2, color="#2563eb")
     ax.axhline(initial_capital, color="grey", linestyle="--", alpha=0.5, linewidth=0.8)
-    ax.set_title("Equity Curve (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
+    ax.set_title("Iron Condor Equity Curve (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("Equity ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "equity_curve.png", dpi=150); plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(14, 5))
     colors = ["#22c55e" if p > 0 else "#ef4444" for p in pnl]
     ax.bar(dates, pnl, color=colors, width=1.0, edgecolor="none")
     ax.axhline(0, color="grey", linewidth=0.5)
-    ax.set_title("Daily PnL (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
+    ax.set_title("Iron Condor Daily PnL (USD)"); ax.set_xlabel("Date"); ax.set_ylabel("PnL ($)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "daily_pnl.png", dpi=150); plt.close(fig)
 
     peaks = np.maximum.accumulate(equity)
     dd_pct = (equity - peaks) / peaks * 100.0
     fig, ax = plt.subplots(figsize=(14, 4))
     ax.fill_between(dates, dd_pct, 0, color="#ef4444", alpha=0.5)
-    ax.set_title("Drawdown (%)"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
+    ax.set_title("Iron Condor Drawdown (%)"); ax.set_xlabel("Date"); ax.set_ylabel("DD (%)"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "drawdown.png", dpi=150); plt.close(fig)
 
     log_dt = log.copy()
@@ -451,7 +505,7 @@ def generate_plots(log, out_dir, initial_capital):
             v = data[yi, mi]
             if np.isfinite(v):
                 ax.text(mi, yi, f"{v:.1f}%", ha="center", va="center", fontsize=8)
-    ax.set_title("Monthly Returns (%)")
+    ax.set_title("Iron Condor Monthly Returns (%)")
     fig.colorbar(im, ax=ax, fraction=0.02, pad=0.04)
     fig.tight_layout(); fig.savefig(out_dir / "monthly_heatmap.png", dpi=150); plt.close(fig)
 
@@ -459,7 +513,7 @@ def generate_plots(log, out_dir, initial_capital):
     ax.hist(pnl, bins=60, color="#6366f1", edgecolor="white", alpha=0.8)
     ax.axvline(np.mean(pnl), color="#ef4444", linestyle="--", label=f"Mean: ${np.mean(pnl):,.0f}")
     ax.axvline(np.median(pnl), color="#22c55e", linestyle="--", label=f"Median: ${np.median(pnl):,.0f}")
-    ax.legend(); ax.set_title("Daily PnL Distribution")
+    ax.legend(); ax.set_title("Iron Condor Daily PnL Distribution")
     ax.set_xlabel("PnL ($)"); ax.set_ylabel("Frequency"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_dir / "pnl_distribution.png", dpi=150); plt.close(fig)
 
@@ -478,14 +532,14 @@ def run_sweep(timings, day_filter, df, interval_label, capitals=None, allocs=Non
         cap_label = f"{cap // 1000}k"
         alloc_int = int(alloc * 100)
 
-        folder_name = f"pure_straddle_{interval_label}_{day_filter}_{tag}_{cap_label}_{alloc_int}pct_{sz_label}_notp"
+        folder_name = f"iron_condor_{interval_label}_{day_filter}_{tag}_{cap_label}_{alloc_int}pct_{sz_label}_notp"
         config_dir = OUT_DIR / folder_name
         config_dir.mkdir(parents=True, exist_ok=True)
 
         label = f"{day_filter} {tag} ${cap_label} {alloc_int}% {sz_label}"
         print(f"[{i}/{total}] {label}", flush=True)
 
-        log = run_pure_straddle(
+        log = run_iron_condor(
             df, entry_t, close_t, day_filter,
             initial_capital=cap, alloc_pct=alloc, flat_sizing=is_flat,
         )
@@ -535,9 +589,9 @@ def main():
     parser.add_argument("--start", type=str, default="0830",
                         help="Start time HHMM (default 0830)")
     parser.add_argument("--capital", type=int, nargs="+", default=None,
-                        help="Starting capital(s), e.g. --capital 20000")
+                        help="Starting capital(s), e.g. --capital 10000")
     parser.add_argument("--alloc", type=int, nargs="+", default=None,
-                        help="Allocation percent(s), e.g. --alloc 40")
+                        help="Allocation percent(s), e.g. --alloc 50")
     args = parser.parse_args()
 
     interval_min = args.interval
@@ -548,13 +602,14 @@ def main():
     start_tag = f"s{args.start}" if args.start != "0830" else ""
     int_label = f"{interval_min}min{start_tag}"
 
-    capitals = args.capital if args.capital else [c for c in DEFAULT_CAPITALS]
+    capitals = args.capital if args.capital else list(DEFAULT_CAPITALS)
     allocs = [a / 100.0 for a in args.alloc] if args.alloc else list(DEFAULT_ALLOCS)
 
     cap_tag = "_".join(f"{c // 1000}k" for c in capitals)
     alloc_tag = "_".join(f"{int(a * 100)}pct" for a in allocs)
 
-    print(f"=== Pure Straddle Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
+    print(f"=== Iron Condor 0DTE Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
+    print(f"Wings: short put 1 strike below ATM, short call 2 strikes above ATM", flush=True)
     print(f"Windows: {len(timings)}", flush=True)
     print(f"Capitals: {capitals}", flush=True)
     print(f"Allocations: {[int(a*100) for a in allocs]}%", flush=True)
@@ -568,7 +623,7 @@ def main():
 
     results = run_sweep(timings, day_filter, df, int_label, capitals=capitals, allocs=allocs)
 
-    out_csv = OUT_DIR / f"pure_straddle_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
+    out_csv = OUT_DIR / f"iron_condor_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
     if results:
         keys = results[0].keys()
         with open(out_csv, "w", newline="") as f:

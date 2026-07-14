@@ -68,7 +68,7 @@ def _get_tier(position_value_usd):
     return LEVERAGE_TIERS[-1][1], LEVERAGE_TIERS[-1][2]
 
 START_DATE = "2024-01-01"
-END_DATE = "2026-03-25"
+END_DATE = "2026-05-31"
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("BTC_DATA_DIR", str(_SCRIPT_DIR / "data")))
 DATA_PATH_1 = DATA_DIR / "btc_0dte_data.parquet"

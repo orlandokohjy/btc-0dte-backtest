@@ -28,8 +28,8 @@ FEE = 0
 TP_ENABLED = False
 LEVERAGE = 10
 SPOT_QTY = 0.5
-CAPITALS = [8_000]
-ALLOCS = [0.60, 0.80]
+DEFAULT_CAPITALS = [8_000]
+DEFAULT_ALLOCS = [0.60, 0.80]
 SIZING_MODES = [("flat", True), ("compound", False)]
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
@@ -54,9 +54,11 @@ def _build_timings(interval_min, start_hh=8, start_mm=30):
     return timings
 
 
-def run_sweep(timings, day_filter, df, interval_label):
+def run_sweep(timings, day_filter, df, interval_label, capitals=None, allocs=None):
+    caps = capitals if capitals is not None else DEFAULT_CAPITALS
+    alcs = allocs if allocs is not None else DEFAULT_ALLOCS
     combos = list(itertools.product(
-        timings, CAPITALS, ALLOCS, SIZING_MODES,
+        timings, caps, alcs, SIZING_MODES,
     ))
     total = len(combos)
     print(f"Total configurations: {total}\n", flush=True)
@@ -136,6 +138,10 @@ def main():
     parser.add_argument("--day-filter", required=True, choices=["weekday", "weekend"])
     parser.add_argument("--start", type=str, default="0830",
                         help="Start time HHMM (default 0830)")
+    parser.add_argument("--capital", type=int, nargs="+", default=None,
+                        help="Starting capital(s), e.g. --capital 10000")
+    parser.add_argument("--alloc", type=int, nargs="+", default=None,
+                        help="Allocation percent(s), e.g. --alloc 50")
     args = parser.parse_args()
 
     interval_min = args.interval
@@ -146,12 +152,18 @@ def main():
     start_tag = f"s{args.start}" if args.start != "0830" else ""
     int_label = f"{interval_min}min{start_tag}"
 
+    capitals = args.capital if args.capital else list(DEFAULT_CAPITALS)
+    allocs = [a / 100.0 for a in args.alloc] if args.alloc else list(DEFAULT_ALLOCS)
+
+    cap_tag = "_".join(f"{c // 1000}k" for c in capitals)
+    alloc_tag = "_".join(f"{int(a * 100)}pct" for a in allocs)
+
     print(f"=== Spot 10x Detailed Sweep: {int_label}, {day_filter} ===", flush=True)
     print(f"Windows: {len(timings)}", flush=True)
     print(f"Leverage: {LEVERAGE}x (spot)", flush=True)
     print(f"QTY: {SPOT_QTY} BTC per straddle", flush=True)
-    print(f"Capitals: {CAPITALS}", flush=True)
-    print(f"Allocations: {[int(a*100) for a in ALLOCS]}%", flush=True)
+    print(f"Capitals: {capitals}", flush=True)
+    print(f"Allocations: {[int(a*100) for a in allocs]}%", flush=True)
     print(f"Sizing: {[s[0] for s in SIZING_MODES]}", flush=True)
     print(f"TP: {TP_ENABLED}, Fee: {FEE}bps, Day filter: {day_filter}", flush=True)
     print(f"Exchange: {EXCHANGE}\n", flush=True)
@@ -160,9 +172,9 @@ def main():
     df = bt.load_data(exchange_filter=EXCHANGE)
     print("Data loaded.\n", flush=True)
 
-    results = run_sweep(timings, day_filter, df, int_label)
+    results = run_sweep(timings, day_filter, df, int_label, capitals=capitals, allocs=allocs)
 
-    out_csv = OUT_DIR / f"spot10x_{int_label}_{day_filter}_detailed_results.csv"
+    out_csv = OUT_DIR / f"spot10x_{int_label}_{day_filter}_{cap_tag}_{alloc_tag}_detailed_results.csv"
     if results:
         keys = results[0].keys()
         with open(out_csv, "w", newline="") as f:
